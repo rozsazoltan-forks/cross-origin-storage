@@ -13,15 +13,16 @@ export interface ModuleOptions {
   packages: Array<string | RegExp>
 }
 
-interface CollectedPackage {
-  /** Bare specifiers this package is imported under (e.g. `vue`, `@vue/runtime-dom`). */
-  specifiers: Set<string>
-  /** Output chunk basename, e.g. `vue` -> emitted as `_nuxt/vue.js`. */
-  chunk: string
-}
+/**
+ * Recipe version embedded in every content-addressed specifier, meant to be bumped
+ * whenever the build recipe (bundler version, options, define replacements)
+ * changes in a way that alters emitted bytes, so chunks built under different
+ * recipes cannot silently collide on the same SHA-256.
+ */
+const RECIPE = 'cos1'
 
-function bareSpecifier(chunk: string): string {
-  return `coschunk-${chunk}`
+function contentSpecifier(hash: string): string {
+  return `${RECIPE}:${hash}`
 }
 
 export default defineNuxtModule<ModuleOptions>({
@@ -47,19 +48,7 @@ export default defineNuxtModule<ModuleOptions>({
 
     addServerPlugin(resolver.resolve('./runtime/server/plugins/inject'))
 
-    const collected = new Map<string, CollectedPackage>()
-    const usedChunkNames = new Set<string>()
-
-    function chunkNameFor(specifier: string): string {
-      let index = 0
-      let name: string
-      do {
-        name = (specifier + (index ? `-${index}` : '')).replace(/[^a-z0-9]/gi, '-').replace(/(^-+)|(-+$)/g, '')
-        index++
-      } while (usedChunkNames.has(name))
-      usedChunkNames.add(name)
-      return name
-    }
+    const collected = new Set<string>()
 
     addVitePlugin(() => ({
       name: 'nuxt-cos',
@@ -76,77 +65,92 @@ export default defineNuxtModule<ModuleOptions>({
             return
           }
 
-          let pkg = collected.get(resolved.id)
-          if (!pkg) {
-            pkg = { specifiers: new Set(), chunk: chunkNameFor(id) }
-            collected.set(resolved.id, pkg)
-          }
-          pkg.specifiers.add(id)
+          collected.add(resolved.id)
 
-          return { id: bareSpecifier(pkg.chunk), external: true }
+          // Externalise under a synthetic specifier so it never clashes with the
+          // real module id elsewhere in the app graph. It is rewritten to a
+          // content-addressed specifier in `generateBundle`, once every managed
+          // chunk has been hashed bottom-up.
+          return { id: `cos-ext:${resolved.id}`, external: true }
         },
       },
       async generateBundle(_outputOptions, bundle) {
-        const externalIds = [...collected.keys()]
-        // Map every bare specifier any managed package may emit to its chunk.
-        const specifierToChunk = new Map<string, string>()
-        for (const pkg of collected.values()) {
-          for (const specifier of pkg.specifiers) {
-            specifierToChunk.set(specifier, pkg.chunk)
-          }
-        }
+        const ids = [...collected]
+        const idSet = new Set(ids)
 
-        const managed: CosManifest['chunks'] = {}
-
-        for (const [input, pkg] of collected) {
+        // Build each managed package once, externalising its siblings. The raw
+        // output keeps sibling imports as their resolved absolute ids, which
+        // double as the dependency edges between managed chunks.
+        const raw = new Map<string, { code: string, deps: string[] }>()
+        for (const input of ids) {
           const builder = await rolldown({
             input,
             platform: 'browser',
             treeshake: false,
-            external: externalIds.filter(id => id !== input),
+            external: ids.filter(id => id !== input),
           })
-          const { output } = await builder.generate({ file: `${pkg.chunk}.js`, codeSplitting: false })
+          const { output } = await builder.generate({ file: 'chunk.js', codeSplitting: false, minify: true })
           await builder.close()
 
-          let code = output[0].code
-          for (const [specifier, chunk] of specifierToChunk) {
-            code = rewriteSpecifier(code, specifier, bareSpecifier(chunk))
+          const code = output[0].code
+          const deps = [...new Set([...code.matchAll(/(?:from|import)\s*["']([^"']+)["']/g)].map(m => m[1]!))]
+            .filter(spec => idSet.has(spec))
+          raw.set(input, { code, deps })
+        }
+
+        // Hash bottom-up: a chunk's specifier for a dependency is that
+        // dependency's content hash, so a chunk can only be hashed once all of
+        // its dependencies have been. The npm graph for these packages is a DAG.
+        const hashes = new Map<string, string>()
+        const managed: CosManifest['chunks'] = {}
+
+        const visit = (id: string, stack: string[]): string => {
+          const existing = hashes.get(id)
+          if (existing) {
+            return existing
           }
-          // Imports rolldown kept as resolved absolute paths to other managed packages.
-          for (const otherId of externalIds) {
-            const chunk = collected.get(otherId)!.chunk
-            code = rewriteSpecifier(code, otherId, bareSpecifier(chunk))
+          if (stack.includes(id)) {
+            throw new Error(`[nuxt-cos] dependency cycle between managed packages: ${[...stack, id].join(' -> ')}`)
           }
 
-          const fileName = `_nuxt/${pkg.chunk}.js`
-          const hash = createHash('sha256').update(code).digest('hex')
-          managed[bareSpecifier(pkg.chunk)] = { file: `${pkg.chunk}.js`, hash }
+          const { code, deps } = raw.get(id)!
+          let resolved = code
+          for (const dep of deps) {
+            resolved = rewriteSpecifier(resolved, dep, contentSpecifier(visit(dep, [...stack, id])))
+          }
+
+          const hash = createHash('sha256').update(resolved).digest('hex')
+          const fileName = `_nuxt/${hash}.js`
+          hashes.set(id, hash)
+          managed[contentSpecifier(hash)] = { file: `${hash}.js`, hash }
           bundle[fileName] = {
             type: 'asset',
             fileName,
-            name: pkg.chunk,
-            names: [pkg.chunk],
+            name: hash,
+            names: [hash],
             originalFileName: null,
             originalFileNames: [],
             needsCodeReference: false,
-            source: code,
+            source: resolved,
           }
+          return hash
         }
 
-        let entry: string | undefined
+        for (const id of ids) {
+          visit(id, [])
+        }
+
+        let entry: CosManifest['entry'] | undefined
         for (const file of Object.values(bundle)) {
           if (file.type !== 'chunk') {
             continue
           }
-          for (const [specifier, chunk] of specifierToChunk) {
-            file.code = rewriteSpecifier(file.code, specifier, bareSpecifier(chunk))
+          for (const id of ids) {
+            file.code = rewriteSpecifier(file.code, `cos-ext:${id}`, contentSpecifier(hashes.get(id)!))
           }
           if (file.isEntry) {
-            entry = bareSpecifier(file.fileName)
-            managed[bareSpecifier(file.fileName)] ??= {
-              file: file.fileName.replace(/^_nuxt\//, ''),
-              hash: createHash('sha256').update(file.code).digest('hex'),
-            }
+            // the entry is app-specific and should not be content-addressed
+            entry = { specifier: `${RECIPE}:entry`, file: file.fileName.replace(/^_nuxt\//, '') }
           }
         }
 

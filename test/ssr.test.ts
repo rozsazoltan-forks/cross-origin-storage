@@ -16,13 +16,13 @@ describe('ssr', async () => {
   it('injects the cos loader and removes the default entry script', async () => {
     const html = await $fetch('/')
     expect(html).toContain('<script id="cos-loader">')
-    expect(html).toContain('coschunk-vue')
+    expect(html).toMatch(/cos1:[a-f0-9]{64}/)
     expect(html).not.toMatch(/<script type="module"[^>]*src="\/_nuxt\/[^"]*"/)
   })
 
-  it('inlines a manifest entry that resolves to a real chunk', async () => {
+  it('inlines a manifest whose entry resolves to a managed chunk', async () => {
     const html = await $fetch('/')
-    const entry = html.match(/"entry":"(coschunk-[^"]+)"/)?.[1]
+    const entry = html.match(/"entry":"(cos1:[a-f0-9]{64})"/)?.[1]
     expect(entry).toBeDefined()
     const chunks = html.match(/"chunks":\{(.+?)\}\}\)/)?.[1] ?? ''
     expect(chunks).toContain(`"${entry}":`)

@@ -18,9 +18,12 @@ declare global {
 export interface CosManifest {
   /** Public base path that managed chunks are served from, e.g. `/_nuxt/`. */
   base: string
-  /** Bare specifier of the entry chunk to import once the import map is ready. */
-  entry: string
-  /** Map of bare specifier to `{ file, hash }` for every managed chunk. */
+  /**
+   * The entry chunk to import once the import map is ready. It is app-specific, so it is
+   * loaded straight from the network rather than stored in COS by a content hash.
+   */
+  entry: { specifier: string, file: string }
+  /** Map of content-addressed specifier to `{ file, hash }` for every COS-managed chunk. */
   chunks: Record<string, { file: string, hash: string }>
 }
 
@@ -70,11 +73,13 @@ export async function runCosLoader(manifest: CosManifest): Promise<void> {
     }),
   )
 
+  imports[manifest.entry.specifier] = new URL(manifest.base + manifest.entry.file, location.origin).href
+
   const script = document.createElement('script')
   script.type = 'importmap'
   script.textContent = JSON.stringify({ imports })
   document.head.appendChild(script)
 
   await new Promise(resolve => setTimeout(resolve, 0))
-  await import(/* @vite-ignore */ manifest.entry)
+  await import(/* @vite-ignore */ manifest.entry.specifier)
 }
