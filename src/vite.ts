@@ -122,36 +122,72 @@ export function cosPlugin(options: CosPluginOptions): Plugin {
       },
     },
     async generateBundle(_outputOptions, bundle) {
-      const ids = [...collected]
-      if (!ids.length) {
+      if (!collected.size) {
         return
       }
-      const idSet = new Set(ids)
       const base = options.base ?? joinBase(resolvedBase, assetsDir)
       const assetPrefix = assetsDir ? `${assetsDir.replace(/^\/+|\/+$/g, '')}/` : ''
 
-      // Build each managed package once, externalising its siblings. The raw
-      // output keeps sibling imports as their resolved absolute ids, which
-      // double as the dependency edges between managed chunks.
+      // Build each managed package standalone, externalising every dependency
+      // by its resolved absolute id. Transitive dependencies are discovered and
+      // queued here, so managing a package implicitly manages its whole import
+      // subgraph (e.g. `vue` pulls in `@vue/*`) without the app having to list
+      // them. The externalised ids double as the edges between managed chunks.
       const raw = new Map<string, { code: string, deps: string[] }>()
-      for (const input of ids) {
-        const builder = await rolldown({
-          input,
-          platform: 'browser',
-          treeshake: false,
-          external: ids.filter(id => id !== input),
-        })
-        // `minify` is part of the pinned recipe (see RECIPE): it both shrinks
-        // the chunk and strips rolldown's `//#region <path>` debug comments,
-        // which embed cwd-relative paths and would otherwise make the hash
-        // depend on the build location.
-        const { output } = await builder.generate({ file: 'chunk.js', codeSplitting: false, minify: true })
-        await builder.close()
+      const queue = [...collected]
+      while (queue.length) {
+        const input = queue.shift()!
+        if (raw.has(input)) {
+          continue
+        }
 
-        const code = output[0].code
-        const deps = [...new Set([...code.matchAll(/(?:from|import)\s*["']([^"']+)["']/g)].map(m => m[1]!))]
-          .filter(spec => idSet.has(spec))
-        raw.set(input, { code, deps })
+        const deps = new Set<string>()
+        let code: string
+        try {
+          const builder = await rolldown({
+            input,
+            platform: 'browser',
+            treeshake: false,
+            plugins: [{
+              name: 'cos-externalise-deps',
+              async resolveId(id, importer) {
+                if (!importer) {
+                  return null
+                }
+                const dep = await this.resolve(id, importer, { skipSelf: true })
+                if (!dep) {
+                  return null
+                }
+                deps.add(dep.id)
+                // Externalise under a synthetic specifier keyed by the resolved
+                // id, so the emitted import is a literal token we rewrite later.
+                // Source specifiers may be relative (`./shared/x.mjs`); the
+                // token makes the rewrite independent of how they were written.
+                return { id: `cos-dep:${dep.id}`, external: true }
+              },
+            }],
+          })
+          // `minify` is part of the pinned recipe (see RECIPE): it both shrinks
+          // the chunk and strips rolldown's `//#region <path>` debug comments,
+          // which embed cwd-relative paths and would otherwise make the hash
+          // depend on the build location.
+          const { output } = await builder.generate({ file: 'chunk.js', codeSplitting: false, minify: true })
+          await builder.close()
+          code = output[0].code
+        }
+        catch (error) {
+          throw new Error(
+            `[cos] cannot bundle managed package as a standalone chunk:\n  ${input}\n`
+            + `It likely imports build-time virtuals (e.g. \`#build/*\`, \`#imports\`) that only `
+            + `resolve inside the host build, so it is not a self-contained, shareable artifact. `
+            + `Only depend on packages whose source resolves from disk on its own.\n\n`
+            + `Underlying error: ${(error as Error).message}`,
+            { cause: error },
+          )
+        }
+
+        raw.set(input, { code, deps: [...deps] })
+        queue.push(...deps)
       }
 
       // Hash bottom-up: a chunk's specifier for a dependency is that
@@ -172,7 +208,7 @@ export function cosPlugin(options: CosPluginOptions): Plugin {
         const { code, deps } = raw.get(id)!
         let resolved = code
         for (const dep of deps) {
-          resolved = rewriteSpecifier(resolved, dep, contentSpecifier(visit(dep, [...stack, id])))
+          resolved = rewriteSpecifier(resolved, `cos-dep:${dep}`, contentSpecifier(visit(dep, [...stack, id])))
         }
 
         const hash = createHash('sha256').update(resolved).digest('hex')
@@ -192,7 +228,7 @@ export function cosPlugin(options: CosPluginOptions): Plugin {
         return hash
       }
 
-      for (const id of ids) {
+      for (const id of raw.keys()) {
         visit(id, [])
       }
 
@@ -201,7 +237,9 @@ export function cosPlugin(options: CosPluginOptions): Plugin {
         if (file.type !== 'chunk') {
           continue
         }
-        for (const id of ids) {
+        // App chunks only reference the packages the app imported directly,
+        // externalised as `cos-ext:<id>` by this plugin's `resolveId`.
+        for (const id of collected) {
           file.code = rewriteSpecifier(file.code, `cos-ext:${id}`, contentSpecifier(hashes.get(id)!))
         }
         if (file.isEntry) {
