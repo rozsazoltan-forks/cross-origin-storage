@@ -102,11 +102,8 @@ export function cosPlugin(options: CosPluginOptions): Plugin {
     },
     resolveId: {
       order: 'pre',
+      filter: { id: packages },
       async handler(id, importer, resolveOptions) {
-        if (!packages.some(p => p.test(id))) {
-          return
-        }
-
         const resolved = await this.resolve(id, importer, { ...resolveOptions, skipSelf: true })
         if (!resolved) {
           return
