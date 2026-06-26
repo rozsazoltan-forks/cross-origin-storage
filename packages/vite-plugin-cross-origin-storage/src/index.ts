@@ -289,16 +289,7 @@ export function cosPlugin(options: CosPluginOptions): Plugin {
         const fileName = `${assetPrefix}${hash}.js`
         hashes.set(id, hash)
         managed[contentSpecifier(hash)] = { file: `${hash}.js`, hash }
-        bundle[fileName] = {
-          type: 'asset',
-          fileName,
-          name: hash,
-          names: [hash],
-          originalFileName: null,
-          originalFileNames: [],
-          needsCodeReference: false,
-          source: resolved,
-        }
+        this.emitFile({ type: 'asset', fileName, source: resolved })
         return hash
       }
 

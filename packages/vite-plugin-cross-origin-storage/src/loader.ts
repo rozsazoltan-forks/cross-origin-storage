@@ -48,6 +48,13 @@ export async function runCosLoader(manifest: CosManifest): Promise<void> {
     }
 
     const response = await fetch(file)
+    if (!response.ok) {
+      throw new Error(`[cos] failed to fetch chunk ${file}: ${response.status} ${response.statusText}`)
+    }
+    const contentType = response.headers.get('content-type') ?? ''
+    if (contentType && !/javascript|ecmascript/i.test(contentType)) {
+      throw new Error(`[cos] chunk ${file} served as ${contentType}, expected JavaScript`)
+    }
     const blob = new Blob([await response.blob()], { type: 'text/javascript' })
 
     if (cos) {

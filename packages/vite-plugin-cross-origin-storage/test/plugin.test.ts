@@ -4,8 +4,11 @@ import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { build } from 'vite'
+import { build as build8 } from 'vite8'
 import { cosPlugin } from '../src/index'
 import type { Alias } from 'vite'
+
+type BuildFn = typeof build
 
 // Build inside the project tree so fixtures resolve packages from the project
 // node_modules rather than a detached temp dir.
@@ -35,7 +38,7 @@ async function buildApp(
   entry: string,
   packages: Array<string | RegExp>,
   alias: Alias[],
-  options: { sourcemap?: boolean } = {},
+  options: { sourcemap?: boolean, build?: BuildFn } = {},
 ): Promise<Built> {
   mkdirSync(scratchRoot, { recursive: true })
   const root = mkdtempSync(join(scratchRoot, 'app-'))
@@ -48,7 +51,7 @@ async function buildApp(
   )
   writeFileSync(join(root, 'src/main.js'), entry)
 
-  await build({
+  await (options.build ?? build)({
     root,
     logLevel: 'error',
     resolve: { alias },
@@ -207,4 +210,35 @@ describe('cosPlugin specifier rewriting', () => {
     expect(map.mappings.length).toBeGreaterThan(0)
     expect(Array.isArray(map.sources)).toBe(true)
   }, 120_000)
+})
+
+describe('cosPlugin under Vite 8 (rolldown)', () => {
+  let app: Built
+
+  beforeAll(async () => {
+    app = await buildApp(
+      'import { ref } from "vue"\ndocument.body.dataset.count = String(ref(0).value)\n',
+      [/^(?:vue$|@vue\/)/],
+      [{ find: 'vue', replacement: resolvePkg('.pnpm/vue@*/node_modules/vue/dist/vue.runtime.esm-bundler.js') }],
+      { build: build8 as unknown as BuildFn },
+    )
+  }, 120_000)
+
+  it('writes content-addressed chunks to disk', () => {
+    expect(app.cosChunks().length).toBeGreaterThanOrEqual(1)
+    for (const file of app.cosChunks()) {
+      const hash = createHash('sha256').update(readFileSync(join(app.assetsDir, file))).digest('hex')
+      expect(hash).toBe(file.replace('.js', ''))
+    }
+  })
+
+  it('resolves every manifest chunk entry to a real file', () => {
+    const html = app.html()
+    const referenced = [...new Set([...html.matchAll(/"file":"([a-f0-9]{64}\.js)"/g)].map(m => m[1]!))]
+    expect(referenced.length).toBeGreaterThanOrEqual(1)
+    const written = new Set(app.cosChunks())
+    for (const file of referenced) {
+      expect(written.has(file)).toBe(true)
+    }
+  })
 })
