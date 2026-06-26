@@ -5,7 +5,7 @@
 
 A Nuxt module that loads shared dependencies (such as `vue`) from [Cross-Origin Storage (COS)](https://github.com/WICG/cross-origin-storage). It extracts those dependencies into content-addressed chunks so that a COS-capable browser can reuse the same chunk across different sites instead of downloading it once per origin.
 
-It is a thin Nuxt wrapper around [`vite-plugin-cross-origin-storage`](https://github.com/danielroe/nuxt-cos/tree/main/packages/vite-plugin-cross-origin-storage); see that package for how the content addressing and sharing work.
+It is a thin Nuxt wrapper around [`vite-plugin-cross-origin-storage`](https://github.com/danielroe/cross-origin-storage/tree/main/packages/vite-plugin-cross-origin-storage); see that package for how the content addressing and sharing work.
 
 ## Setup
 
